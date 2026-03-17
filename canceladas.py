@@ -47,6 +47,31 @@ def df_to_excel_bytes(df: pd.DataFrame, sheet_name: str = "Canceladas") -> bytes
 # EXTRACCIÓN Y TRANSFORMACIÓN
 # -------------------------------------------------
 @st.cache_data
+def load_supervisores():
+    """Carga el catálogo de empleados para obtener al Jefe Inmediato (Supervisor)"""
+    sql = """
+    SELECT DISTINCT
+        e.[Nombre Completo] AS NombreCompleto,
+        e.[Jefe Inmediato]  AS JefeDirecto
+    FROM reporte_empleado('EMPRESA_MAESTRA',1,'','') AS e
+    WHERE
+        e.[Canal de Venta] = 'ATT'
+        AND e.[Operacion]   = 'CONTACT CENTER'
+        AND e.[Tipo Tienda] = 'VIRTUAL'
+        AND e.[Estatus] = 'ACTIVO';
+    """
+    conn = get_connection()
+    df = pd.read_sql(sql, conn)
+    conn.close()
+    
+    # Limpieza básica para el jefe directo
+    df["JefeDirecto"] = df["JefeDirecto"].astype(str).str.strip()
+    df["JefeDirecto"] = df["JefeDirecto"].replace({"nan": "", "None": ""})
+    df["JefeDirecto"] = df["JefeDirecto"].replace("", "ENCUBADORA")
+    
+    return df
+
+@st.cache_data
 def load_canceladas(fecha_ini, fecha_fin):
     fi = fecha_ini.strftime("%Y%m%d")
     ff = fecha_fin.strftime("%Y%m%d")
@@ -68,13 +93,9 @@ def load_canceladas(fecha_ini, fecha_fin):
     return df
 
 def calcular_estatus_anterior(row):
-    """
-    Compara las fechas de los distintos estatus para encontrar
-    cuál fue el último paso por el que pasó la orden.
-    """
+    """Calcula el último estatus antes de la cancelación basándose en las fechas"""
     fechas = {}
     
-    # Extraemos y convertimos las fechas de las columnas que sabemos que existen
     if pd.notna(row.get('Fecha creacion')): 
         fechas['Nuevo'] = pd.to_datetime(row['Fecha creacion'], errors='coerce')
     if pd.notna(row.get('Back Office')): 
@@ -84,13 +105,11 @@ def calcular_estatus_anterior(row):
     if pd.notna(row.get('Entregado')): 
         fechas['Entregado'] = pd.to_datetime(row['Entregado'], errors='coerce')
     
-    # Filtramos fechas nulas (NaT) y las fechas por defecto de SQL (año 1900)
     fechas_validas = {k: v for k, v in fechas.items() if pd.notna(v) and v.year > 1900}
     
     if not fechas_validas:
         return "Desconocido"
         
-    # El estatus anterior es simplemente el que tiene la fecha más reciente
     estatus_anterior = max(fechas_validas, key=fechas_validas.get)
     return estatus_anterior
 
@@ -112,39 +131,57 @@ with st.sidebar:
         st.cache_data.clear()
         st.rerun()
 
+# 1. Cargar ambas bases de datos
 df_raw = load_canceladas(f_ini, f_fin)
+df_empleados = load_supervisores()
 
 if df_raw.empty:
     st.info("No hay cancelaciones ('Canc Error') en este periodo.")
 else:
     df_procesado = df_raw.copy()
     
-    # 1. Asignamos al usuario que canceló (¡usando el nombre exacto de tu DB con el error ortográfico!)
+    # 2. Hacer el cruce (JOIN) para traer al Supervisor
+    df_procesado = df_procesado.merge(
+        df_empleados,
+        how="left",
+        left_on="Vendedor",
+        right_on="NombreCompleto"
+    )
+    
+    # Llenar vacíos por si algún vendedor no tiene supervisor asignado
+    df_procesado["JefeDirecto"] = df_procesado["JefeDirecto"].fillna("SIN SUPERVISOR")
+    
+    # 3. Asignar usuario de cancelación
     if 'Usuario cancleacion' in df_procesado.columns:
         df_procesado['Log_Cancelacion (Usuario)'] = df_procesado['Usuario cancleacion']
     else:
         df_procesado['Log_Cancelacion (Usuario)'] = "No disponible"
         
-    # 2. Calculamos el estatus anterior basado en las fechas
+    # 4. Calcular el estatus anterior
     df_procesado['Log_Anterior (Estatus)'] = df_procesado.apply(calcular_estatus_anterior, axis=1)
     
-    # Renombrar columnas para la vista
-    df_procesado = df_procesado.rename(columns={"Vendedor": "Ejecutivo", "Fecha cancelacion": "Fecha Cancelación"})
+    # Renombrar columnas para la tabla final
+    df_procesado = df_procesado.rename(columns={
+        "JefeDirecto": "Supervisor",
+        "Vendedor": "Ejecutivo", 
+        "Fecha cancelacion": "Fecha Cancelación"
+    })
             
-    # Seleccionar las columnas finales para mostrar
+    # 5. Seleccionar y ordenar las columnas a mostrar
     cols_display = [
-        "Folio", "Ejecutivo", "Cliente", "Estatus", 
+        "Folio", "Supervisor", "Ejecutivo", "Cliente", "Estatus", 
         "Fecha Cancelación", "Log_Anterior (Estatus)", "Log_Cancelacion (Usuario)"
     ]
     
-    # Asegurarnos de que solo intentamos mostrar columnas que sí existen
+    # Validar que existan antes de mostrarlas
     cols_display = [c for c in cols_display if c in df_procesado.columns]
     df_display = df_procesado[cols_display]
 
+    # Métricas y Tabla
     st.metric("Total Canceladas", len(df_display))
-    
     st.dataframe(df_display, use_container_width=True, hide_index=True)
     
+    # Descarga
     st.download_button(
         label="📥 Descargar Canceladas en Excel",
         data=df_to_excel_bytes(df_display, "Canceladas"),
